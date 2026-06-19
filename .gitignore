@@ -1,0 +1,16 @@
+# MIT-BIH data — too large for GitHub
+data/mitdb/
+
+# Conda environment
+envs/
+*.conda
+conda-meta/
+
+# Jupyter
+.ipynb_checkpoints/
+*.pyc
+__pycache__/
+
+# OS
+.DS_Store
+Thumbs.db
