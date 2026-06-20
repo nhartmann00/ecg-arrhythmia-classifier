@@ -56,6 +56,10 @@ wfdb.dl_database('mitdb', dl_dir='data/mitdb')
 
 Accuracy (0.91) is intentionally de-emphasized; the dataset is heavily imbalanced toward N beats. Macro F1 per class is the correct evaluation metric.
 
+First Confusion Matrix (RR features, QRS wavelet features, no P-wave):
+
+![Confusion Matrix](results/confusion_matrix.png)
+
 ## Repo Structure
 
 ```
