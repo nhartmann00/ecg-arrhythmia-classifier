@@ -34,7 +34,8 @@ wfdb.dl_database('mitdb', dl_dir='data/mitdb')
 **Feature Extraction**
 - RR interval features (4): current RR, pre/post ratio, local mean, normalized RR
 - Wavelet features (18): db4, 5-level decomposition — energy, mean, std per subband
-- Total: 22 features per beat across 98,384 beats (48 records)
+- P wave features (8): db2 wavelet level-3 approximation coefficients, signed peak amplitude, energy — extracted from 108-137 sample window before R-peak
+- Total: 30 features per beat across 98,384 beats (48 records)
 
 **Classification**
 - Random Forest with `class_weight='balanced'`
@@ -46,17 +47,17 @@ wfdb.dl_database('mitdb', dl_dir='data/mitdb')
 | Class | Description | F1 Score |
 |-------|-------------|----------|
 | N | Normal | 0.96 |
-| S | Supraventricular | 0.32 |
-| V | Ventricular | 0.43 |
+| S | Supraventricular | 0.30 |
+| V | Ventricular | 0.45 |
 | F | Fusion | 0.00 * |
 
-**Macro F1: 0.43** (holdout) &nbsp;|&nbsp; **CV Macro F1: 0.472 ± 0.060**
+**Macro F1: 0.43** (holdout) &nbsp;|&nbsp; **CV Macro F1: 0.473 ± 0.073**
 
 \* F class excluded from optimization — extreme inter-patient variability makes it untrainable at this dataset size.
 
 Accuracy (0.91) is intentionally de-emphasized; the dataset is heavily imbalanced toward N beats. Macro F1 per class is the correct evaluation metric.
 
-First Confusion Matrix (RR features, QRS wavelet features, no P-wave):
+Confusion Matrix (RR features, QRS wavelet features, P-wave Features):
 
 ![Confusion Matrix](results/confusion_matrix.png)
 
@@ -83,6 +84,8 @@ First Confusion Matrix (RR features, QRS wavelet features, no P-wave):
 - **Recall prioritized for V class**: Clinical cost of a missed ventricular arrhythmia (false negative) outweighs the cost of a false alarm (false positive).
 - **SMOTE applied inside CV folds only**: Applying SMOTE before splitting leaks synthetic samples into validation folds.
 - **db4 wavelet for feature extraction**: 4 vanishing moments make db4 blind to smooth polynomial baseline drift while remaining sensitive to sharp QRS transients — the correct tradeoff for 360 Hz ECG morphology.
+- **db2 wavelet for P wave extraction**: Fewer vanishing moments make db2 sensitive to smooth, low-frequency morphology resembling the P wave shape — contrasts with db4 which targets sharp QRS transients
+- **Signed amplitude over absolute value**: P wave polarity must be preserved — inverted P waves in junctional beats would be indistinguishable from upright ones if absolute value were used
 
 ## Environment
 
