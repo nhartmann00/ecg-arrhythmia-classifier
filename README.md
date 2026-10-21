@@ -227,18 +227,6 @@ The dominant failure is the collapse of S into N: **2,255 of 2,690 S beats (83.8
 
 Per-fold macro F1 is partly noise: F-class support ranges from 1 to 375 beats per fold, and a class with one test beat contributes an F1 of either 0 or 1, moving that fold's macro F1 by 0.25. This is why the aggregate per-class table is the primary result.
 
-### Comparison with published inter-patient results
-
-Most published MIT-BIH classifiers are evaluated intra-patient, with beats from the same patients in both training and test sets. A 2023 systematic review of deep-learning arrhythmia classifiers found that, among studies stating their protocol, 86.7% used intra-patient evaluation and 10.3% inter-patient, with notable performance degradation in the inter-patient setting [2]. Intra-patient results are not comparable to the results here.
-
-The fair comparison is with inter-patient work. The reference method, de Chazal et al. (2004), reports on the 44 non-paced records [1]:
-
-| | de Chazal et al. (2004) | This project |
-|---|---|---|
-| V sensitivity / +P | 77.7% / 81.9% | 70.3% / 76.5% |
-| S sensitivity / +P | 75.9% / 38.5% | **8.8%** / 27.8% |
-
-The protocols differ: de Chazal used a fixed 22/22 record split rather than cross-validation, two ECG leads rather than one, and manually annotated beat locations rather than detector output. Those differences can explain a modest gap. They do not explain an S sensitivity nearly nine times lower. **V performance is in the published range; S performance is not, and the inter-patient protocol alone does not account for it.**
 
 ### What limits the classifier
 
@@ -280,7 +268,7 @@ The mechanism was confirmed empirically. db4 D1/D2 sub-band energy in contaminat
 
 ### 2. Detection errors propagate into classification
 
-The feature matrix is built from detector output, not reference annotations, so detection failures feed directly into the classifier (see record 228 above). Building the feature matrix from reference annotations would decouple detection from classification, and would also make the results directly comparable with de Chazal et al.
+The feature matrix is built from detector output, not reference annotations, so detection failures feed directly into the classifier (see record 228 above). Building the feature matrix from reference annotations would decouple detection from classification.
 
 ### 3. Single lead
 
