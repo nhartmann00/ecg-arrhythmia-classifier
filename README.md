@@ -1,22 +1,37 @@
 # ECG Arrhythmia Classifier
 
-Beat-level arrhythmia classification on the MIT-BIH Arrhythmia Database, built to the ANSI/AAMI EC57 standard — with an emphasis on **verifying the pipeline against ground truth at every stage** rather than reporting a headline accuracy number.
+A beat-level ECG pipeline on the MIT-BIH Arrhythmia Database, validated against ANSI/AAMI EC57, where per-record analysis found failures that a 97.6% aggregate sensitivity hides: a reversed lead on record 114, and a QRS detector on record 228 that keeps 82% of ventricular beats while discarding 96% of normal ones.
 
-> **Project status: active development.** The detector and classifier both run end-to-end across all 48 records. Two defects have been identified, quantified, and are pending fixes (see [Known Defects](#known-defects)). Classification metrics below are reported as a **provisional baseline** and are expected to change once those fixes land. They should not be read as final performance.
+The pipeline runs end to end: filtering, a from-scratch Pan-Tompkins detector, wavelet and RR-interval features, and a Random Forest classifier evaluated with patient-wise cross-validation. The classifier handles ventricular beats reasonably and fails on supraventricular beats. Its known and suspected causes are documented below.
+
+> **Status: scoped and complete.** The detector has been validated against EC57 across all 48 records, and every defect found has been either fixed or quantified and documented. The largest known defect, beat-window contamination, was measured but deliberately left unfixed to keep the project in scope. Remaining work is listed in the [Roadmap](#roadmap).
 
 ---
 
-## Why this repo is structured around validation
+## Headline results
 
-Published results on MIT-BIH vary enormously depending on evaluation protocol. Intra-patient splits — where beats from the same subject appear in both training and test sets — routinely report >98% accuracy and are not clinically meaningful, because a deployed device never sees the patient it was trained on. This project uses the **inter-patient paradigm** throughout.
+| | Result |
+|---|---|
+| Detector, gross Se / +P (44 non-paced records, 100,733 beats) | **97.63% / 99.52%** |
+| Detector, average-of-records Se / +P | 97.48% / 99.47% |
+| Annotation reconciliation | 109,494 beats, matching the published MIT-BIH total exactly |
+| Classifier, 5-fold patient-wise CV macro F1 (F, N, S, V) | 0.455 ± 0.046 |
+| Classifier, V sensitivity / +P | 70.3% / 76.5% |
+| Classifier, S sensitivity / +P | **8.8%** / 27.8% |
 
-More importantly: the classifier consumes the output of a QRS detector. If the detector is wrong, every downstream feature and metric is built on corrupted input, and no amount of model tuning will surface that. A substantial portion of the work here is measuring detector error before trusting classifier results.
+---
+
+## How the project developed
+
+The classifier came first. Its results were poor for the minority classes, especially S and F, and adding P-wave features and SMOTE oversampling barely moved them. Instead of continuing to tune the model, I traced the problem upstream. That revealed that the R-peak detector feeding the classifier had never been validated against ground truth, so the detector was validated against EC57, record by record, before trusting any classifier result. That work found the annotation-parsing error, the lead reversal on record 114, the population failure on record 228, and the beat-window contamination described below.
+
+The contamination is likely a significant contributor to the poor classifier results. It was quantified and its mechanism confirmed, but fixing it properly means redesigning segmentation and the feature matrix, so it was left out of scope and is documented as a limitation.
 
 ---
 
 ## Dataset
 
-[MIT-BIH Arrhythmia Database](https://physionet.org/content/mitdb/1.0.0/) — 48 half-hour two-lead recordings at 360 Hz with expert beat-by-beat annotations. Accessed via `wfdb`. Data is not tracked in this repo.
+[MIT-BIH Arrhythmia Database](https://physionet.org/content/mitdb/1.0.0/): 48 half-hour two-lead recordings from 47 subjects at 360 Hz, with expert beat-by-beat annotations. Accessed via `wfdb`. Data is not tracked in this repo.
 
 ```python
 import wfdb
@@ -25,13 +40,19 @@ wfdb.dl_database('mitdb', dl_dir='data/mitdb')
 
 ### Annotation handling
 
-Raw WFDB annotation files mix genuine beat labels with non-beat markers (rhythm changes, signal-quality flags, comments, flutter-wave boundaries). Counting these as beats inflates apparent detector miss rates.
+Raw WFDB annotation files mix genuine beat labels with non-beat markers (rhythm changes, signal-quality flags, comments, flutter boundaries). Counting these as beats inflates apparent detector miss rates.
 
-An `AAMI_MAP` dictionary was built mapping the 15 genuine beat symbols (`N L R e j A a J S V E F / f Q`) to the five AAMI classes; every other symbol is filtered before any count comparison.
+An `AAMI_MAP` dictionary maps the 15 genuine beat symbols (`N L R e j A a J S V E F / f Q`) to the five AAMI classes, and every other symbol is filtered out before any count comparison.
 
-**Validation:** after filtering, the summed beat count across all 48 records is **109,494 — matching the published MIT-BIH total exactly.** The stripped non-beat annotations total **3,153**, independently matching the discrepancy observed before the correction. Two independently-derived figures reconciling to the same numbers is what justified trusting the downstream analysis.
+After filtering, the summed beat count across all 48 records is **109,494, matching the published MIT-BIH total exactly**. The stripped non-beat annotations total 3,153, independently matching the discrepancy seen before the correction.
 
-This correction materially changed the picture. Record 231 contained 427 comment annotations (`"`), each counted as a missed beat — its apparent miss rate fell from 21.9% to **0.1%** once filtered. Records 219, 200, and 222 showed similar collapses. Most of the "detector problem" was an annotation-parsing problem.
+This correction changed the picture substantially. Record 231 contained 427 comment annotations, each previously counted as a missed beat; its apparent miss rate fell from 21.9% to 0.1% once they were filtered. Records 219, 200 and 222 showed similar collapses. Much of the early "detector problem" was an annotation-parsing problem.
+
+### Record handling
+
+- **Lead selection by name.** The pipeline selects the MLII lead by its `sig_name` rather than assuming channel 0. A sweep of all 48 records found three that do not have MLII on channel 0: record 114 (`['V5', 'MLII']`, leads reversed) and records 102 and 104 (`['V5', 'V2']`, no limb lead at all because of surgical dressings).
+- **Paced records excluded.** Records 102, 104, 107 and 217 contain paced beats and are excluded under EC57, from both detector scoring and classifier training and evaluation.
+- **Same-subject records grouped.** Records 201 and 202 come from the same subject, so they are merged into a single group for patient-wise splitting. Cross-validation runs over 43 subjects.
 
 ---
 
@@ -41,203 +62,282 @@ This correction materially changed the picture. Record 231 contained 427 comment
 
 | Stage | Implementation | Rationale |
 |---|---|---|
-| Baseline wander removal | 2nd-order Butterworth high-pass @ 0.5 Hz, `filtfilt` | AHA-recommended corner. Zero-phase filtering prevents the phase distortion that would shift R-peak positions and invalidate timing-tolerance scoring. |
-| Powerline interference | Dual notch @ 60 Hz **and** 120 Hz | The 2nd harmonic is present in MIT-BIH records; most implementations remove only the fundamental. |
+| Baseline wander removal | 2nd-order Butterworth high-pass @ 0.5 Hz, `filtfilt` | AHA-recommended corner. Zero-phase filtering avoids shifting R-peak positions, which would corrupt timing-tolerance scoring. |
+| Powerline interference | Dual notch @ 60 Hz and 120 Hz | The second harmonic is present in MIT-BIH records; many implementations remove only the fundamental. |
 | High-frequency noise | 2nd-order Butterworth low-pass @ 40 Hz | |
-| Normalization | Per-record z-score | Global normalization computed across all records would leak test-set statistics into training. |
+| Normalization | Per-record z-score | Global normalization across records would leak test-set statistics into training. |
 
-### R-peak detection — Pan-Tompkins, implemented from scratch
+### R-peak detection: Pan-Tompkins, implemented from scratch
 
-1. 5–15 Hz bandpass isolating QRS spectral content
-2. **5-point Lagrange differentiation stencil `[-1,-8,0,8,1]/12h`**
-3. Squaring (rectification + emphasis of high slopes)
+1. 5–15 Hz bandpass to isolate QRS spectral content
+2. 5-point Lagrange differentiation stencil `[-1,-8,0,8,1]/12h`
+3. Squaring
 4. 150 ms moving-window integration
 5. Adaptive dual thresholding
 6. Peak refinement: `argmax` in the cleaned signal within ±50 ms of the integrator-detected peak
 
-**On the derivative stencil:** the original 1985 paper specifies `[-1,-2,0,2,1]/8h`. That is a lower-order approximation chosen for real-time integer arithmetic on 1980s hardware. The `[-1,-8,0,8,1]/12h` stencil used here was derived from the full 5-point Lagrange interpolating polynomial and is the more accurate estimator; the derivation was worked through symbolically rather than taken on faith.
+The original 1985 paper specifies the stencil `[-1,-2,0,2,1]/8h`, a lower-order approximation chosen for integer arithmetic on 1980s hardware. The stencil used here was derived from the full 5-point Lagrange interpolating polynomial and is the more accurate estimator.
+
+**Known deviations from the published algorithm** (documented, not yet fixed):
+
+- The signal-peak estimate (SPKI) is seeded from the *mean* of all candidates in the first two seconds rather than the maximum. This biases it low and mixes T-waves into the signal estimate.
+- There is no T-wave discrimination step (the 200–360 ms slope comparison).
+- The 200 ms refractory period is applied globally through `find_peaks(distance=...)` rather than relative to each accepted QRS.
+- There is no search-back for missed beats.
+
+### Beat segmentation
+
+Each beat is a fixed 360-sample window (1 second), 180 samples either side of the refined R-peak. This window is the source of the contamination described in [Known limitations](#1-beat-segmentation-window-contamination).
 
 ### Feature extraction
 
-- **RR interval features (4):** current RR, pre/post ratio, local mean, normalized RR
-- **Wavelet features (18):** db4, 5-level decomposition — energy, mean, std per sub-band
-- **P-wave features (8):** signed peak amplitude, band energy, db2 level-3 approximation coefficients
-- **Current feature matrix: 30 features × 98,384 beats**
+30 features per beat, over **98,324 beats** (Q-class beats removed; paced records excluded):
 
-The P-wave block is presently included in the live pipeline but is **flagged for removal** — it did not improve results and its extraction window was never validated. See [P-wave feature investigation](#p-wave-feature-investigation).
+- **RR interval features (4):** current RR, pre/post ratio, local mean, normalized RR
+- **QRS morphology, wavelet (18):** db4, 5-level decomposition of the 360-sample beat window; energy, mean and standard deviation of each of the 6 sub-bands
+- **P-wave (8):** signed peak amplitude, energy, and the 6 db2 level-3 approximation coefficients of a 30-sample window before the R-peak
+
+See [Feature design](#feature-design) for the reasoning behind each choice.
 
 ### Classification
 
 - Random Forest, `class_weight='balanced'`, `random_state=42`
-- Patient-wise holdout split (38 train / 10 test)
-- 5-fold `GroupKFold` cross-validation grouped on patient ID
-- SMOTE oversampling applied **inside training folds only**, targeting 10% of the N-class count for S and V, with a guard skipping resampling when the target is already met
+- Four classes: F, N, S, V. AAMI class Q (unclassifiable) is excluded from training and evaluation.
+- 5-fold `GroupKFold`, grouped on subject ID (201 and 202 merged)
+- SMOTE applied **inside training folds only**, oversampling S and V to 10% of the N-class count. A per-class guard skips resampling when the target is already met, or when a class has fewer than `k_neighbors + 1` samples.
+
+---
+
+## Feature design
+
+### QRS morphology: db4, 5 levels
+
+At 360 Hz, a 5-level decomposition splits each beat into these sub-bands:
+
+| Sub-band | Frequency range | Content |
+|---|---|---|
+| D1 | 90–180 Hz | Above the 40 Hz low-pass; mostly residual noise and sharp edges |
+| D2 | 45–90 Hz | Mostly above the 40 Hz low-pass |
+| D3 | 22.5–45 Hz | Steep QRS slopes |
+| D4 | 11.25–22.5 Hz | Core QRS energy |
+| D5 | 5.6–11.25 Hz | Core QRS energy; broad, slow QRS (as in V beats) |
+| A5 | 0–5.6 Hz | P and T waves, residual baseline |
+
+- **Why db4:** four vanishing moments make it blind to polynomial trends up to degree 3, so smooth baseline drift does not leak into the detail bands, while it still responds sharply to QRS transients.
+- **Why 5 levels:** 5 is the maximum useful decomposition depth for a 360-sample window with the 8-tap db4 filter. One more level would be dominated by boundary effects.
+- **Why energy:** it describes how the beat's power is distributed across frequency bands. A wide ventricular QRS shifts energy toward D5 and A5; a narrow normal QRS concentrates it in D3 and D4.
+- **Why standard deviation:** it measures how strongly each band's coefficients vary across the window, which reflects how much of the beat's shape lives in that band.
+- **Limitation of mean:** for the detail bands, the mean of the wavelet coefficients is expected to be close to zero by construction, since each wavelet has zero integral. Those 5 features probably carry little information. They were kept for consistency and not tested individually.
+- **Limitation of D1 and D2:** both bands sit largely above the 40 Hz low-pass. Their 6 features mostly describe noise, and, as the contamination analysis showed, energy injected by a neighbouring beat.
+
+### P-wave: db2, 3 levels
+
+- **Why db2:** with fewer vanishing moments and a shorter filter, it is better matched to smooth, rounded, low-frequency shapes like a P wave than db4, which is tuned to sharp transients.
+- **Why 3 levels:** 3 is the maximum useful depth for a 30-sample window with the 4-tap db2 filter. The level-3 approximation covers 0–22.5 Hz, which contains the P-wave band, and yields 6 coefficients. Each coefficient summarizes about 8 samples (22 ms), so together they describe the coarse shape of the window.
+- **Why signed peak amplitude:** S beats can produce inverted P waves. An absolute value would make inverted and upright P waves look identical and destroy the information most relevant to S.
+- **Why energy:** absent or flattened P waves, also characteristic of some S beats, show up as low energy in the window.
+
+The window itself was never validated. See [P-wave feature investigation](#p-wave-feature-investigation).
 
 ---
 
 ## Detector validation (ANSI/AAMI EC57)
 
-A beat-matching harness was built to score detected R-peaks against reference annotations:
+### The harness
 
-- **Two-pointer matching** with a **±150 ms (±54 sample) tolerance window**, per EC57
+`check_peaks()` scores detected R-peaks against reference annotations:
+
+- Two-pointer matching with a **±150 ms (±54 sample) tolerance window**, per EC57
 - Reference beats filtered through `AAMI_MAP` before matching
-- Explicit cleanup sweep for the leftover pointer after the main loop
-- **Verified against a hand-traced synthetic case before being run on real data**
-- Guarded by two balance assertions: `matches + misses == n_true` and `matches + false_alarms == n_detected`
-- Returns raw `(matches, misses, false_alarms)` counts per record — deliberately **not** percentages, since gross sensitivity is not recoverable from a list of per-record rates
+- Verified on a hand-traced synthetic case before being run on real data
+- **Precondition:** detections must be strictly increasing, asserted before the matching loop. The balance equations alone cannot catch unsorted input, because every beat still lands in exactly one bucket.
+- **Postconditions:** `matches + misses == n_true` and `matches + false_alarms == n_detected`, asserted after the loop
+- Returns raw `(matches, misses, false_alarms)` counts per record, not percentages, because gross sensitivity cannot be recovered from a list of per-record rates
 
 Sensitivity = `matches / (matches + misses)`; positive predictivity = `matches / (matches + false_alarms)`.
 
-### Results: six records account for essentially all detection error
+### Full-record results
 
-| Record | True beats | Detected | Error | Failure mode |
-|---|---|---|---|---|
-| **228** | 2,053 | 358 | **82.6% missed** | Adaptive threshold fails to recover after an amplitude excursion — *working hypothesis, partially verified* |
-| **104** | 2,229 | 922 | **58.6% missed** | Paced record; miss mechanism plausible but **not verified to the same standard as 228** |
-| **114** | 1,879 | 1,234 | **34.3% missed** | Unexplained. Lead reversal is documented for this record in PhysioNet — *hypothesis, untested* |
-| **207** | 1,860 | 2,053 | **10.4% over-detected** | Ventricular flutter — continuous sinusoidal waveform with no discrete per-cycle QRS causes multiple firings per cycle. Morphology problem, not a threshold problem. |
-| **108** | 1,763 | 1,929 | **9.4% over-detected** | Unexplained |
-| 203 | 2,980 | 2,774 | 6.9% missed | Literature-documented noisy record; not yet investigated |
+The full 48-record run completed with zero assertion failures. Over the 44 non-paced records (100,733 beats):
 
-**All 42 remaining records fall under 2% error, most under 0.5%.**
+| | Se | +P |
+|---|---|---|
+| Gross | **97.63%** | **99.52%** |
+| Average of records | 97.48% | 99.47% |
 
-### Bin-density diagnostic
+Misses are heavily concentrated. The worst records are **228 (Se 17.3%)**, 203 (92.7%) and 201 (96.5%).
 
-Aggregate Se/+P tells you *how badly* a record fails but not *how*. A windowed diagnostic computing sensitivity per 30-second bin (10,800 samples) across each full record was built to characterize the **temporal structure** of failure.
+The total beat gap is fully reconciled: the difference between annotated beats (109,494) and detections (106,246) equals total misses minus total false alarms exactly. There is no unexplained remainder.
 
-This distinguishes failure classes that aggregate metrics conflate: record 228 shows discrete collapse-and-recovery episodes consistent with threshold staleness, whereas record 207 shows uniformly distributed over-detection consistent with a morphology mismatch. The two require entirely different fixes; the aggregate number alone would not have revealed that.
+Two records flagged as problems early in the project, 207 and 108, turned out not to be. Their apparent "over-detection" came from comparing raw beat counts rather than scoring matched beats.
 
-An investigation into record 228's first collapse window found elevated V-beat density (6.0% vs 2.3% baseline), but the second collapse window contained **zero** V beats — refuting a single PVC-cluster explanation. A follow-on check refuted an initial "lower amplitude" hypothesis: the bad window's median integrated peak height was *higher* than a comparable good window. This analysis is noted as incomplete — `find_peaks` was run without a `prominence` constraint and is picking up 3–4× more local maxima than real beats, which dilutes the medians. The directional finding is probably sound; it has not been cleaned up.
+### Record 114: lead reversal (confirmed and fixed)
 
----
+PhysioNet documents that record 114's leads are reversed: channel 0 is V5, not MLII. Re-running detection on the MLII channel raised its sensitivity from **65.5% to 99.9%** (+P 100.0%). Every earlier hypothesis about 114's failures (a PVC cluster, a threshold-driving spike, an oscillating recovery) was an artifact of running the detector on the wrong lead. The fix generalized into selecting the lead by name.
 
-## Known defects
+### Record 228: the detector finds the wrong population (characterized, not fixed)
 
-### 1. Beat segmentation window contamination
+Record 228 detects at 17.3% sensitivity. The investigation proceeded as a sequence of measurements, each of which ruled something out:
 
-`segment_beats()` currently extracts a fixed 360-sample window (180 samples either side of the R-peak). For beats with short RR intervals, this window **overlaps the neighbouring beat**, injecting foreign QRS energy into the sample.
+1. **The beats are found, then rejected.** Every one of the 1,697 missed beats has a candidate peak within the ±54-sample tolerance, and over half have a candidate on the exact annotation sample (nearest-candidate distance percentiles at the 50th, 75th, 90th and 95th: 0, 0, 1, 1 samples). The matched beats served as a control and also came back at 100%, which confirmed the alignment between candidates and annotations. So `find_peaks` did not delete the missed beats. Every one was a candidate that the adaptive threshold rejected.
+2. **There are two amplitude populations.** In the integrated signal, rejected beats have a median height of about 4,600 versus about 32,200 for accepted beats, a roughly 7× gap. In the raw normalized ECG, the gap is about 3× (median 2.71 versus 8.17). Squaring the derivative turns 3× into 7×.
+3. **The detector keeps ectopics and discards normals.** Broken down by annotation symbol, the detector found **82% of V beats (296 / 362) but only 3.6% of N beats (60 / 1,688)**. It is not failing to detect beats; it is consistently detecting the wrong population.
+4. **There is no regime change.** Misses and matches are interleaved across the whole record. This contradicts an earlier reading, from a sampled window, that sensitivity "collapses" partway through.
 
-Quantified by constructing leading- and trailing-edge boolean masks (exclusive-end slice semantics give true thresholds of 180/360 s and 179/360 s respectively):
+The evidence is consistent with an **initialization lock**: a burst of tall beats early in the record, inside the two-second learning phase, seeds SPKI on the ectopic population. The threshold settles between the two populations, normal beats never clear it, and each rejection updates the noise estimate rather than correcting the signal estimate. This mechanism has not been confirmed by tracing the threshold itself; that measurement is the first item on the roadmap.
 
-| Class | Beats affected |
-|---|---|
-| V (ventricular) | **~54%** |
-| F (fusion) | **~36%** |
-| S (supraventricular) | **~30%** |
-| N (normal) | ~6.5% |
-| **Overall** | **10,583 / 98,384 (~10.75%)** |
+Aggregate Se/+P would have reported 228 as "17% sensitivity" and nothing more. The finding only appears when the misses are broken down by beat type.
 
-The contamination is concentrated precisely in the minority classes the model exists to detect.
+### Record 104: closed
 
-**Mechanism confirmed empirically, not assumed.** db4 D1/D2 sub-band energy in contaminated V beats is **2.3–2.7× higher** than in clean V beats. Critically, *near-threshold-but-clean* beats show no such elevation — which isolates mechanical window overlap as the cause and rules out the alternative explanation that short-coupling-interval beats are simply physiologically different.
-
-**Planned fix:** physiologically-scoped, RR-bounded variable windows with a hard RR ceiling. Deferred until detector validation is resolved, since window boundaries are meaningless if the R-peaks they are centred on are wrong.
-
-### 2. Paced records included in training
-
-Records **102, 104, 107, and 217** contain paced beats and are excluded from evaluation under EC57. They are currently still present in the training set. Removal pending.
-
-### 3. Same-subject leakage in cross-validation
-
-Records **201 and 202 are the same subject** in MIT-BIH. `GroupKFold` groups on record ID, so these can land in different folds — a residual leakage path that the patient-wise split was specifically designed to eliminate. Not yet addressed.
-
-### 4. Unreconciled beat count
-
-There is a **3,067-beat gap** between the current dataset size and the expected AAMI-filtered total. Not yet explained.
-
-### 5. Detection error propagates into classification
-
-The classifier's feature matrix is built from *detector output*, not from reference annotations. This couples detection failures directly into classification results — the 82.6% miss rate on record 228 means that record contributes almost no beats to training. Building the feature matrix from reference annotations would decouple the two and is under consideration.
+Record 104 is paced and has no limb lead available. Both causes of its low sensitivity are exclusions under the standard, not algorithm defects.
 
 ---
 
-## Provisional classification results
+## Classification results
 
-**These numbers are a baseline, not a result.** They were produced before the segmentation fix, before paced-record exclusion, and using a feature matrix derived from a detector with six known-failing records. They are published here for transparency and will change.
+5-fold patient-wise `GroupKFold`, 43 subjects:
 
-**Current configuration** — 30 features, SMOTE inside training folds, 5-fold `GroupKFold`:
-**macro F1 = 0.473 ± 0.073**
+**Macro F1 = 0.455 ± 0.046** (mean of per-fold macro F1 over F, N, S, V)
 
-Per-fold breakdown, which is far more informative than the mean:
+### Aggregate per-class performance
 
-| Fold | S support | S F1 | V F1 | N F1 | Macro F1 |
+Computed from the confusion matrix summed across all five folds, which is more reliable than averaging per-fold scores (see below):
+
+| Class | Description | Precision (+P) | Recall (Se) | F1 | Support |
 |---|---|---|---|---|---|
-| 1 | 1,493 | 0.01 | 0.66 | 0.95 | 0.40 |
-| 2 | 195 | 0.08 | 0.49 | 0.96 | 0.38 |
-| 3 | **17** | 0.01 | 0.91 | 0.99 | 0.48 |
-| 4 | 808 | 0.50 | 0.83 | 0.97 | 0.58 |
-| 5 | 173 | 0.32 | 0.81 | 0.96 | 0.52 |
-
-Earlier configurations, for reference: 22 features without SMOTE gave 0.472 ± 0.060; 22 features with SMOTE gave 0.481 ± 0.076. All of these comparisons predate the detector and segmentation findings below and should be treated as measurements of a defective pipeline, not as feature-selection evidence.
-
-Patient-wise holdout (38/10 split):
-
-| Class | Description | Precision | Recall | F1 | Support |
-|---|---|---|---|---|---|
-| N | Normal | 0.98 | 0.94 | 0.96 | 18,971 |
-| S | Supraventricular ectopic | 0.29 | 0.31 | 0.30 | 338 |
-| V | Ventricular ectopic | 0.34 | 0.67 | 0.45 | 762 |
-| F | Fusion | 0.00 | 0.00 | 0.00 | 14 |
-
-Overall accuracy is 0.92 and is **deliberately not treated as a headline metric** — the dataset is ~90% N beats, so a classifier predicting N for everything would score similarly. Per-class F1 is the correct instrument.
-
-The F class score of 0.00 reflects only 14 F beats in the holdout test set, not a demonstrated inability to learn the class. With 36% of F beats also window-contaminated, no conclusion about F is currently supportable.
+| N | Normal | 0.947 | 0.979 | 0.963 | 88,120 |
+| V | Ventricular ectopic | 0.765 | 0.703 | 0.733 | 6,729 |
+| S | Supraventricular ectopic | 0.278 | **0.088** | 0.133 | 2,690 |
+| F | Fusion | 0.010 | 0.003 | 0.004 | 785 |
 
 ![Confusion Matrix](results/confusion_matrix.png)
 
-The aggregated confusion matrix across all five folds shows the dominant failure mode clearly: **2,140 of 2,686 S beats (79.7%) are misclassified as N**, along with 1,657 V beats and 751 of 785 F beats. Nearly everything the model gets wrong, it gets wrong in the same direction — collapsing minority classes into the majority.
+The dominant failure is the collapse of S into N: **2,255 of 2,690 S beats (83.8%) are predicted as N**. F is effectively never detected (2 of 785 correct).
 
-### Why the aggregate macro F1 is close to uninformative
+### Per-fold results
 
-The S class is dominated by a handful of subjects. Of 2,686 S beats in the dataset, **patient 232 contributes 1,381 (51%)**; patients 232, 209, and 222 together contribute 73%.
+| Fold | S support | S F1 | V F1 | N F1 | Macro F1 |
+|---|---|---|---|---|---|
+| 1 | 231 | 0.03 | 0.68 | 0.98 | 0.42 |
+| 2 | **1,387** | **0.00** | 0.74 | 0.94 | 0.42 |
+| 3 | 485 | 0.42 | 0.69 | 0.96 | 0.52 |
+| 4 | 120 | 0.01 | 0.66 | 0.97 | 0.41 |
+| 5 | 467 | 0.19 | 0.86 | 0.96 | 0.50 |
 
-Under patient-wise `GroupKFold`, this produces S-class support ranging from **17 to 1,493 beats across folds — an 88× spread** (see per-fold table above). Fold 3, with 17 S beats, produces an S F1 of 0.01 that carries no information whatsoever, yet contributes equally to the mean. Averaging noise with signal yields a number that describes neither.
+Per-fold macro F1 is partly noise: F-class support ranges from 1 to 375 beats per fold, and a class with one test beat contributes an F1 of either 0 or 1, moving that fold's macro F1 by 0.25. This is why the aggregate per-class table is the primary result.
 
-Per-fold reporting is the appropriate substitute. **This finding is independent of the pipeline defects documented below** — it is a property of MIT-BIH's label distribution and will survive every fix on the roadmap.
+### Comparison with published inter-patient results
 
-### P-wave feature investigation
+Most published MIT-BIH classifiers are evaluated intra-patient, with beats from the same patients in both training and test sets. A 2023 systematic review of deep-learning arrhythmia classifiers found that, among studies stating their protocol, 86.7% used intra-patient evaluation and 10.3% inter-patient, with notable performance degradation in the inter-patient setting [2]. Intra-patient results are not comparable to the results here.
 
-S-class beats originate ectopically outside the SA node, producing altered atrial depolarization — inverted, flattened, early, or absent P waves. This motivated a P-wave feature set: **signed** peak amplitude (polarity preserved, since absolute value would make inverted junctional P waves indistinguishable from upright ones), band energy, and db2 level-3 approximation coefficients. db2 was chosen over db4 because fewer vanishing moments make it sensitive to smooth, low-frequency rounded morphology rather than sharp QRS transients.
+The fair comparison is with inter-patient work. The reference method, de Chazal et al. (2004), reports on the 44 non-paced records [1]:
 
-**Outcome: no improvement, and a net harm where it mattered.** Aggregate macro F1 moved from 0.472 to 0.473 — inside the noise. Per-fold comparison against a pre-P-wave git baseline showed S-class F1 **degrading** on folds 4 and 5 — the only two folds with statistically meaningful S support — from 0.58 → 0.50 and 0.36 → 0.32 respectively.
+| | de Chazal et al. (2004) | This project |
+|---|---|---|
+| V sensitivity / +P | 77.7% / 81.9% | 70.3% / 76.5% |
+| S sensitivity / +P | 75.9% / 38.5% | **8.8%** / 27.8% |
 
-Diagnosis: the extraction window itself was never properly validated. The 30-sample (83 ms) window at samples 108–137 is **shorter than a physiological P wave (80–100 ms)** and gives only ~12 Hz FFT resolution — a single bin across the entire 0.5–10 Hz P-wave band. Visual inspection also showed the window's right edge clipping QRS onset.
+The protocols differ: de Chazal used a fixed 22/22 record split rather than cross-validation, two ECG leads rather than one, and manually annotated beat locations rather than detector output. Those differences can explain a modest gap. They do not explain an S sensitivity nearly nine times lower. **V performance is in the published range; S performance is not, and the inter-patient protocol alone does not account for it.**
 
-**Next step for this workstream:** compute the empirical distributions of QRS onset and T-wave peak positions relative to the R-peak across all beats, and derive the window from those distributions rather than from an estimate. P-wave features stay out of the recommended feature set until that is done.
+### What limits the classifier
+
+The cause of the S failure has not been isolated. The candidate causes, with what has and has not been measured:
+
+1. **Beat-window contamination** (prevalence measured; effect on classification not measured). About 30% of S beats, 54% of V beats and 36% of F beats have windows that overlap a neighbouring beat, so the wavelet features for those beats partly describe the wrong beat. This corrupts a large share of exactly the minority-class features. It is unlikely to be the whole S story, though: about 70% of S beats are uncontaminated and are still mostly misclassified, and V beats, which are the most contaminated class, are classified at a level comparable to the literature. See [Known limitations](#1-beat-segmentation-window-contamination).
+2. **RR features are not separating S from N** (observed, not explained). S beats are premature, and RR-interval features are the main S discriminator in the inter-patient literature [1]. RR features are not affected by window contamination, yet S recall is 8.8%. Either the RR features are not computed or normalized in a way that captures prematurity, or something else is masking them. This has not been investigated.
+3. **Inter-patient variation, concentrated in one patient** (measured). Patient 232 contributes 1,381 of the 2,690 S beats (51%); patients 232, 209 and 222 together contribute about 73%. Fold 2 holds patient 232, and its S recall is 0.00: when the model has not trained on 232, it cannot recognize 232's S beats at all. SMOTE does not help here: in fold 2, it oversamples S to 7,181 beats from roughly 1,300 real ones, none from patient 232, and it can only interpolate between examples it already has.
+4. **Unvalidated P-wave features** (measured as unhelpful). See [P-wave feature investigation](#p-wave-feature-investigation).
+5. **Detection errors in the training data** (measured for the detector; effect on classification not measured). The feature matrix is built from detector output. On record 228, the detector kept mostly V beats and discarded most N beats, so the beats 228 contributes to training are heavily biased toward V.
+
+Excluding the paced records, as EC57 requires, had no effect: it removed 707 beats (506 N, 201 V) and changed macro F1 from 0.4544 to 0.4547, about 1% of one standard deviation. S and F counts were unchanged, as expected, since paced records contribute no S beats and paced fusion beats map to Q.
+
+A single 10-patient holdout split is kept in the notebook as a sanity check but is not reported here. One split is dominated by which patients happen to land in the test set; S performance in particular swings depending on whether patient 232 is drawn.
+
+---
+
+## Known limitations
+
+### 1. Beat segmentation window contamination
+
+`segment_beats()` extracts a fixed 360-sample window (180 samples either side of the R-peak). For beats with short RR intervals, this window overlaps the neighbouring beat and injects foreign QRS energy.
+
+Measured with leading- and trailing-edge boolean masks, on the 98,384-beat matrix from before the record-114 fix and the paced exclusion:
+
+| Class | Beats affected |
+|---|---|
+| V | ~54% |
+| F | ~36% |
+| S | ~30% |
+| N | ~6.5% |
+| Overall | 10,583 / 98,384 (~10.75%) |
+
+The contamination is concentrated in exactly the minority classes the model exists to detect.
+
+The mechanism was confirmed empirically. db4 D1/D2 sub-band energy in contaminated V beats is 2.3–2.7× higher than in clean V beats, while beats near the threshold that are not contaminated show no such elevation. That isolates mechanical window overlap as the cause and rules out the alternative that short-coupling-interval beats are simply physiologically different.
+
+**Why it is not fixed here.** It was left out to keep the project in scope. A quick fix, cutting each beat at the RR midpoint, produces variable-length beats that break the fixed-width wavelet feature matrix. Resampling them to a fixed length destroys QRS width, one of the main features separating V from N beats, and zero-padding them makes the morphology features encode the RR interval. The proper fix is RR-bounded variable-length windows with features that do not assume a fixed width, which means redesigning segmentation and feature extraction together.
+
+### 2. Detection errors propagate into classification
+
+The feature matrix is built from detector output, not reference annotations, so detection failures feed directly into the classifier (see record 228 above). Building the feature matrix from reference annotations would decouple detection from classification, and would also make the results directly comparable with de Chazal et al.
+
+### 3. Single lead
+
+Only MLII is used. The reference inter-patient method uses two leads.
+
+---
+
+## P-wave feature investigation
+
+**Outcome: no improvement, and harm where it mattered.** On an earlier version of the pipeline, adding the P-wave block moved aggregate macro F1 from 0.472 to 0.473, which is noise, and per-fold comparison showed S-class F1 *degrading* on the only two folds with meaningful S support.
+
+The extraction window was never validated. The 30-sample (83 ms) window, from 120 to 200 ms before the R-peak, is shorter than a physiological P wave (80–100 ms) plus its margins, gives only about 12 Hz of FFT resolution (a single bin across the whole 0.5–10 Hz P-wave band), and visibly clips QRS onset.
+
+The next step is to compute the empirical distributions of QRS onset and T-wave peak positions relative to the R-peak, and derive the window from those distributions rather than from an estimate.
 
 ---
 
 ## Key design decisions
 
-- **Inter-patient (patient-wise) splitting over random splitting.** Beat-level random splits leak same-subject data across train and test, inflating results. `GroupKFold` on patient ID is the methodologically correct choice and is the reason the numbers here are far below commonly published figures.
-- **Zero-phase filtering (`filtfilt`) throughout.** Phase distortion would shift detected R-peak positions, which directly corrupts a ±150 ms timing-tolerance evaluation.
-- **Dual notch (60 + 120 Hz)** rather than fundamental-only.
+- **Inter-patient splitting.** Beat-level random splits put the same patient's beats in both training and test sets and inflate results. `GroupKFold` on subject ID gives a realistic estimate of performance on an unseen patient.
+- **Zero-phase filtering (`filtfilt`) throughout.** Phase distortion would shift R-peak positions and corrupt a ±150 ms timing-tolerance evaluation.
+- **Dual notch (60 + 120 Hz)** rather than the fundamental only.
 - **Lagrange-derived 5-point stencil** over the original Pan-Tompkins coefficients.
-- **db4 for QRS morphology:** 4 vanishing moments make it blind to smooth polynomial baseline drift while remaining sensitive to sharp QRS transients.
-- **db2 for P-wave morphology:** fewer vanishing moments suit smooth low-frequency shapes.
-- **Signed over absolute amplitude** for P-wave polarity.
-- **Raw counts stored, not percentages,** in detector scoring — gross sensitivity is not recoverable from per-record rates.
-- **Restart-and-run-all discipline** treated as a correctness requirement rather than friction. It caught a real bug where `per_record_processing()` was not accumulating beats across records.
-- **SMOTE applied inside training folds only.** Applying it before splitting would leak synthetic samples derived from validation beats into training. A dynamic sampling strategy targets 10% of the N-class count for S and V, with a guard skipping resampling when that target is already exceeded. On the 22-feature matrix it gave 0.481 ± 0.076 vs 0.472 ± 0.060 — a marginal mean gain at meaningfully higher variance, suggesting class balance is not the binding constraint. It remains in the pipeline pending re-evaluation against a corrected feature matrix.
+- **Raw counts, not percentages,** in detector scoring.
+- **SMOTE inside training folds only.** Applying it before splitting would leak synthetic samples derived from test beats into training.
 
-### Clinical interpretation
-
-The baseline model shows high V-class recall relative to precision (recall 0.65, precision 0.32). This is the preferable direction of error for this application: the cost of a missed ventricular arrhythmia is far higher than the cost of a false alarm routed to human review. Noting this as an observed property and a desirable one — it was not an explicit optimization target.
+Feature choices are covered in [Feature design](#feature-design).
 
 ---
 
 ## Roadmap
 
-1. Implement search-back in `adaptive_threshold()` (requires tracking time since last confirmed QRS and a running mean RR, plus restructuring from a single forward pass to allow reconsideration of already-rejected candidates)
-2. Investigate records 114, 108, and 203 — none currently have confirmed explanations
-3. Complete the full 48-record time-matched Se/+P run and report gross and per-record figures
-4. Implement RR-bounded segmentation windows and re-verify contamination elimination via D1/D2 energy diagnostics
-5. Exclude paced records 102, 104, 107, 217
-6. Resolve records 201/202 same-subject grouping
-7. Re-derive the P-wave window from empirical QRS-onset and T-wave distributions, or remove the P-wave block
-8. Re-evaluate SMOTE against the corrected feature matrix
-9. Re-run all classification results against the corrected pipeline
-10. Refactor the notebook into `src/` modules
+**Detector**
+
+1. Trace the adaptive threshold on record 228 (threshold, SPKI and NPKI per candidate) and measure the ratio of threshold to rejected-peak height near annotated beats. A ratio under 2 means search-back is sufficient; well over 2 means the fix belongs in initialization.
+2. Bring the detector in line with Pan-Tompkins: seed SPKI from the maximum rather than the mean, add T-wave discrimination, apply the refractory period relative to accepted QRS complexes, and add search-back.
+3. Investigate record 203 (Se 92.7%).
+
+**Classifier**
+
+4. Check whether the RR features separate S from N at all, by comparing their distributions for the two classes.
+5. Implement RR-bounded variable-length segmentation windows and re-verify that contamination is eliminated using the D1/D2 energy diagnostic.
+6. Build the feature matrix from reference annotations, to decouple classifier evaluation from detector errors.
+7. Re-derive the P-wave window from empirical QRS-onset and T-wave distributions, or remove the P-wave block.
+8. Test whether the detail-band means and the D1/D2 features carry any information, and drop them if not.
+9. Re-evaluate SMOTE against the corrected feature matrix.
+
+**Code**
+
+10. Split the notebook into reusable Python modules.
+
+---
+
+## References
+
+1. P. de Chazal, M. O'Dwyer, R. B. Reilly, "Automatic classification of heartbeats using ECG morphology and heartbeat interval features," *IEEE Transactions on Biomedical Engineering*, 51(7), pp. 1196–1206, 2004. [Link](https://www.tara.tcd.ie/items/ddf100f9-52e5-4772-b993-18eb190541a0)
+2. "Deep Learning-Based ECG Arrhythmia Classification: A Systematic Review," *Applied Sciences*, 13(8), 4964, 2023. [Link](https://www.mdpi.com/2076-3417/13/8/4964)
 
 ---
 
@@ -245,15 +345,10 @@ The baseline model shows high V-class recall relative to precision (recall 0.65,
 
 ```
 ├── notebooks/
-│   └── 01_data_exploration.ipynb   # Full pipeline: preprocessing → detection → features → CV
-├── src/                            # Scaffolded; refactor pending pipeline stabilization
-│   ├── preprocessing.py
-│   ├── pan_tompkins.py
-│   ├── features.py
-│   ├── model.py
-│   └── data_loader.py
+│   └── 01_ecg_pipeline.ipynb   # Full pipeline: preprocessing → detection → EC57 validation → features → CV
 ├── results/
-├── data/                           # Not tracked — see download instructions
+│   └── confusion_matrix.png
+├── data/                       # Not tracked; see download instructions
 └── requirements.txt
 ```
 
